@@ -1,7 +1,7 @@
 # volmix
-An arduino based software volume mixer becuz why not >.&lt;\n
-Main.cpp is the arduino code\n
-other files are stuff for the host pc\n
+An arduino based software volume mixer becuz why not >.&lt;
+Main.cpp is the arduino code
+other files are stuff for the host pc
 ## 🚀 Quick Install
 
 Run the following command in your terminal to install the VolMix Matrix GUI and Backend Service:
