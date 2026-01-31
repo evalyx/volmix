@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # --- CONFIGURATION ---
-# Direct links to your v1.0.1 release
-BACKEND_URL="https://github.com/evalyx/volmix/releases/download/v1.0.1/volmix_backend"
+# Direct links to your v1.0.1 and v1.0.2 release
+BACKEND_URL="https://github.com/evalyx/volmix/releases/download/v1.0.2/volmix_backend"
 GUI_URL="https://github.com/evalyx/volmix/releases/download/v1.0.1/VolMixGUI"
 
 BIN_PATH="/usr/local/bin"
@@ -34,7 +34,7 @@ echo "Preparing download workspace..."
 mkdir -p /tmp/volmix_install
 
 # 2. Download Binaries
-echo "Downloading VolMix v1.0.1 from GitHub..."
+echo "Downloading VolMix v1.0.1 and v1.0.2 from GitHub..."
 curl -L "$BACKEND_URL" -o /tmp/volmix_install/volmix-backend
 curl -L "$GUI_URL" -o /tmp/volmix_install/volmix-gui
 
