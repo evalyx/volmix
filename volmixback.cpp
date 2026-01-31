@@ -118,53 +118,88 @@ void applyVolume(std::string targetId, int rawValue, int faderIdx) {
 }
 
 void serialThread() {
-    int fd = open(SERIAL_PORT, O_RDONLY | O_NOCTTY);
-    if (fd < 0) return;
-    struct termios tty;
-    tcgetattr(fd, &tty);
-    cfsetispeed(&tty, BAUD_RATE); cfsetospeed(&tty, BAUD_RATE);
-    tty.c_cflag |= (CLOCAL | CREAD | CS8);
-    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    tcsetattr(fd, TCSANOW, &tty);
+    while (true) {
+        // 1. Attempt to open the port
+        int fd = open(SERIAL_PORT, O_RDONLY | O_NOCTTY);
 
-    isSerialAlive = true;
-    std::vector<int> lastVals(10, -1);
-    std::string buffer; char c;
+        if (fd < 0) {
+            isSerialAlive = false;
+            refreshUI(); // Update UI to show "DEAD"
+            // Wait before trying again to avoid CPU pegging
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
 
-    while (read(fd, &c, 1) > 0) {
-        if (c == '\n') {
-            if (buffer.find("DATA") != std::string::npos) {
-                std::vector<int> vals; std::stringstream ss(buffer); std::string item;
-                while (std::getline(ss, item, ',')) {
-                    if (item == "DATA") continue;
-                    try { vals.push_back(std::stoi(item)); } catch (...) {}
-                }
-                if (vals.size() >= 9) {
-                    activeLayer = vals[0];
-                    for(int i = 1; i <= 8; i++) rawDebugVals[i] = vals[i];
+        // 2. Configure the port
+        struct termios tty;
+        if (tcgetattr(fd, &tty) != 0) {
+            close(fd);
+            continue;
+        }
 
-                    if (std::abs(vals[1] - lastVals[1]) > THRESHOLD) {
-                        applyVolume("@DEFAULT_AUDIO_SINK@", vals[1], 1);
-                        lastVals[1] = vals[1];
+        cfsetispeed(&tty, BAUD_RATE);
+        cfsetospeed(&tty, BAUD_RATE);
+        tty.c_cflag |= (CLOCAL | CREAD | CS8);
+        tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+        tcsetattr(fd, TCSANOW, &tty);
+
+        isSerialAlive = true;
+        refreshUI();
+
+        std::vector<int> lastVals(10, -1);
+        std::string buffer;
+        char c;
+
+        // 3. Read loop
+        // read() will return <= 0 if the device is unplugged
+        while (read(fd, &c, 1) > 0) {
+            if (c == '\n') {
+                if (buffer.find("DATA") != std::string::npos) {
+                    std::vector<int> vals;
+                    std::stringstream ss(buffer);
+                    std::string item;
+                    while (std::getline(ss, item, ',')) {
+                        if (item == "DATA") continue;
+                        try { vals.push_back(std::stoi(item)); } catch (...) {}
                     }
 
-                    for (int i = 1; i <= 7; i++) {
-                        if (std::abs(vals[i+1] - lastVals[i+1]) > THRESHOLD) {
-                            std::lock_guard<std::mutex> lock(uiMutex);
-                            auto range = layeredMapping[activeLayer].equal_range(i);
-                            for (auto it = range.first; it != range.second; ++it) {
-                                applyVolume(it->second.id, vals[i+1], i+1);
-                            }
-                            lastVals[i+1] = vals[i+1];
+                    if (vals.size() >= 9) {
+                        activeLayer = vals[0];
+                        for(int i = 1; i <= 8; i++) rawDebugVals[i] = vals[i];
+
+                        // Master Fader
+                        if (std::abs(vals[1] - lastVals[1]) > THRESHOLD) {
+                            applyVolume("@DEFAULT_AUDIO_SINK@", vals[1], 1);
+                            lastVals[1] = vals[1];
                         }
+
+                        // Other Faders
+                        for (int i = 1; i <= 7; i++) {
+                            if (std::abs(vals[i+1] - lastVals[i+1]) > THRESHOLD) {
+                                std::lock_guard<std::mutex> lock(uiMutex);
+                                auto range = layeredMapping[activeLayer].equal_range(i);
+                                for (auto it = range.first; it != range.second; ++it) {
+                                    applyVolume(it->second.id, vals[i+1], i+1);
+                                }
+                                lastVals[i+1] = vals[i+1];
+                            }
+                        }
+                        refreshUI();
                     }
-                    refreshUI();
                 }
+                buffer.clear();
+            } else if (c != '\r') {
+                buffer += c;
             }
-            buffer.clear();
-        } else if (c != '\r') buffer += c;
+        }
+
+        // 4. Cleanup on disconnect
+        isSerialAlive = false;
+        close(fd);
+        refreshUI();
+        // Short pause before attempting to reconnect
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    isSerialAlive = false; close(fd);
 }
 
 int main() {
