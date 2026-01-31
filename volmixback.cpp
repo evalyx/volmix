@@ -14,11 +14,14 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <poll.h>
+#include <cstdlib>
 
 const char* SERIAL_PORT = "/dev/ttyUSB0";
 const int BAUD_RATE = B115200;
 const int THRESHOLD = 8;
-const std::string CONFIG_FILE = "volmix.conf";
+
+// Use a global string for the path determined at runtime
+std::string GLOBAL_CONFIG_PATH = "";
 
 struct FaderConfig {
     std::string id;
@@ -26,13 +29,29 @@ struct FaderConfig {
 };
 
 std::mutex uiMutex;
-std::map<int, std::map<int, FaderConfig>> layeredMapping;
+// Changed to multimap to allow multiple targets per fader
+std::map<int, std::multimap<int, FaderConfig>> layeredMapping;
 std::vector<int> currentPercents(9, 0);
 std::vector<int> rawDebugVals(9, 0);
 int activeLayer = 0;
 bool isSerialAlive = false;
 
 // --- UTILS ---
+
+// Resolves /home/$USER/.config/volmix/volmix.conf
+std::string getConfigPath() {
+    const char* home = std::getenv("HOME");
+    std::string path;
+    if (home) {
+        path = std::string(home) + "/.config/volmix";
+    } else {
+        path = "./config"; // Fallback
+    }
+    // Create directory if missing
+    system(("mkdir -p " + path).c_str());
+    return path + "/volmix.conf";
+}
+
 time_t getFileMTime(const std::string& path) {
     struct stat st;
     if (stat(path.c_str(), &st) != 0) return 0;
@@ -42,15 +61,15 @@ time_t getFileMTime(const std::string& path) {
 void loadConfig() {
     std::lock_guard<std::mutex> lock(uiMutex);
     layeredMapping.clear();
-    std::ifstream f_in(CONFIG_FILE);
+    std::ifstream f_in(GLOBAL_CONFIG_PATH);
     int cl, cf; std::string cid, calias;
-    while (f_in >> cl >> cf >> cid >> calias) { 
-        layeredMapping[cl][cf] = {cid, calias}; 
+    while (f_in >> cl >> cf >> cid >> calias) {
+        layeredMapping[cl].insert({cf, {cid, calias}});
     }
 }
 
 void saveConfig() {
-    std::ofstream f_out(CONFIG_FILE);
+    std::ofstream f_out(GLOBAL_CONFIG_PATH);
     for (auto const& [lay, faders] : layeredMapping) {
         for (auto const& [f, cfg] : faders) {
             f_out << lay << " " << f << " " << cfg.id << " " << cfg.alias << "\n";
@@ -68,13 +87,18 @@ std::string getBar(int percent, std::string label) {
 }
 
 void refreshUI() {
-    if (!isatty(STDIN_FILENO)) return; // Don't spam UI if not in a terminal
+    if (!isatty(STDIN_FILENO)) return;
     std::lock_guard<std::mutex> lock(uiMutex);
     std::cout << "\033[s\033[1;1H\033[1;37;44m";
     std::cout << " L" << activeLayer << " | " << (isSerialAlive ? "LIVE" : "DEAD") << " | ";
     std::cout << getBar(currentPercents[1], "MST") << " " << currentPercents[1] << "% | ";
+
     for(int i = 1; i <= 7; i++) {
-        std::string label = (layeredMapping[activeLayer].count(i)) ? layeredMapping[activeLayer][i].alias : "F" + std::to_string(i);
+        std::string label = "F" + std::to_string(i);
+        if (layeredMapping[activeLayer].count(i)) {
+            label = layeredMapping[activeLayer].find(i)->second.alias;
+            if (layeredMapping[activeLayer].count(i) > 1) label += "+";
+        }
         std::cout << getBar(currentPercents[i+1], label) << " ";
     }
     std::cout << "\033[0m\033[K\033[u" << std::flush;
@@ -106,7 +130,7 @@ void serialThread() {
     isSerialAlive = true;
     std::vector<int> lastVals(10, -1);
     std::string buffer; char c;
-    
+
     while (read(fd, &c, 1) > 0) {
         if (c == '\n') {
             if (buffer.find("DATA") != std::string::npos) {
@@ -126,10 +150,11 @@ void serialThread() {
 
                     for (int i = 1; i <= 7; i++) {
                         if (std::abs(vals[i+1] - lastVals[i+1]) > THRESHOLD) {
-                            std::string target = "";
-                            { std::lock_guard<std::mutex> lock(uiMutex);
-                              if (layeredMapping[activeLayer].count(i)) target = layeredMapping[activeLayer][i].id; }
-                            applyVolume(target, vals[i+1], i+1);
+                            std::lock_guard<std::mutex> lock(uiMutex);
+                            auto range = layeredMapping[activeLayer].equal_range(i);
+                            for (auto it = range.first; it != range.second; ++it) {
+                                applyVolume(it->second.id, vals[i+1], i+1);
+                            }
                             lastVals[i+1] = vals[i+1];
                         }
                     }
@@ -143,10 +168,11 @@ void serialThread() {
 }
 
 int main() {
+    GLOBAL_CONFIG_PATH = getConfigPath();
     loadConfig();
-    time_t lastMTime = getFileMTime(CONFIG_FILE);
+    time_t lastMTime = getFileMTime(GLOBAL_CONFIG_PATH);
 
-    std::thread sThread(serialThread); 
+    std::thread sThread(serialThread);
     sThread.detach();
 
     struct pollfd fds[1];
@@ -154,27 +180,27 @@ int main() {
     fds[0].events = POLLIN;
 
     while (true) {
-        // 1. Check if config file was updated by the GUI
-        time_t currentMTime = getFileMTime(CONFIG_FILE);
+        time_t currentMTime = getFileMTime(GLOBAL_CONFIG_PATH);
         if (currentMTime > lastMTime) {
             loadConfig();
             lastMTime = currentMTime;
         }
 
-        // 2. Check for terminal input without blocking the whole program
-        int ret = poll(fds, 1, 100); // 100ms timeout
+        int ret = poll(fds, 1, 100);
         if (ret > 0 && (fds[0].revents & POLLIN)) {
             std::string input;
             if (!std::getline(std::cin, input) || input == "exit") break;
-            
-            // Handle terminal commands (same as your original logic)
-            if (input == "ls") { /* show interface logic */ }
+
+            if (input == "ls") {
+                std::cout << "Config Path: " << GLOBAL_CONFIG_PATH << "\n";
+                // Add your full interface display logic here if needed
+            }
             else if (input.substr(0, 7) == "unbind ") {
                 int ul, uf; char ud; std::stringstream ss(input.substr(7));
                 if (ss >> ul >> ud >> uf) {
                     { std::lock_guard<std::mutex> lock(uiMutex); layeredMapping[ul].erase(uf); }
                     saveConfig();
-                    lastMTime = getFileMTime(CONFIG_FILE); // Prevent self-reload
+                    lastMTime = getFileMTime(GLOBAL_CONFIG_PATH);
                 }
             } else {
                 int l, f; std::string id, name = "";
@@ -183,15 +209,14 @@ int main() {
                 std::stringstream pss(processed);
                 if (pss >> l >> f >> id) {
                     if (!(pss >> name)) name = "F" + std::to_string(f);
-                    { std::lock_guard<std::mutex> lock(uiMutex); layeredMapping[l][f] = {id, name}; }
-                    saveConfig();
-                    lastMTime = getFileMTime(CONFIG_FILE);
+                    { std::lock_guard<std::mutex> lock(uiMutex);
+                        layeredMapping[l].insert({f, {id, name}}); }
+                        saveConfig();
+                        lastMTime = getFileMTime(GLOBAL_CONFIG_PATH);
                 }
             }
             std::cout << "Command: " << std::flush;
         }
-        
-        // Brief sleep to prevent CPU spiking
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

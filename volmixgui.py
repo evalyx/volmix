@@ -1,4 +1,5 @@
 import sys, subprocess, re, os
+from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QComboBox, QLabel, QPushButton,
                              QTableWidget, QTableWidgetItem, QHeaderView,
@@ -6,7 +7,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 
-CONFIG_FILE = "volmix.conf"
+# Resolve the XDG-compliant path
+CONFIG_DIR = Path.home() / ".config" / "volmix"
+CONFIG_FILE = str(CONFIG_DIR / "volmix.conf")
+
+# Create directory if it doesn't exist
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 BREEZE_STYLE = """
     QMainWindow { background-color: #31363b; }
@@ -33,13 +39,13 @@ BREEZE_STYLE = """
 class VolMixMatrix(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VolMix - Matrix")
+        self.setWindowTitle("VolMix - Matrix Control")
         self.setMinimumSize(1000, 550)
         self.setStyleSheet(BREEZE_STYLE)
 
         self.all_targets = {}
         self.visible_columns = []
-        self.mappings = {} # Store as {(layer, fader): [target_id1, target_id2]}
+        self.mappings = {}
 
         self.init_ui()
         self.refresh_wpctl()
@@ -77,7 +83,7 @@ class VolMixMatrix(QMainWindow):
         for t, f in [("Import", self.import_dialog), ("Export", self.export_dialog)]:
             b = QPushButton(t); b.clicked.connect(f); btns.addWidget(b)
         btns.addStretch()
-        btns.addWidget(QLabel("<small>Sylveon VolMix | Multiple Targets per Fader Enabled</small>"))
+        btns.addWidget(QLabel(f"<small>Config: {CONFIG_FILE}</small>"))
         layout.addLayout(btns)
 
     def refresh_wpctl(self):
@@ -107,19 +113,12 @@ class VolMixMatrix(QMainWindow):
 
     def handle_cell_click(self, row, col):
         layer, fader, target_id = self.layer_spin.value(), row + 1, self.visible_columns[col]
-
-        # 1. ENFORCE UNIQUE TARGET: If this target is bound anywhere else in this layer, remove it first
         for f in range(1, 8):
             if f != fader and target_id in self.mappings.get((layer, f), []):
                 self.mappings[(layer, f)].remove(target_id)
-
-        # 2. TOGGLE BINDING:
         current_list = self.mappings.get((layer, fader), [])
-        if target_id in current_list:
-            current_list.remove(target_id)
-        else:
-            current_list.append(target_id)
-
+        if target_id in current_list: current_list.remove(target_id)
+        else: current_list.append(target_id)
         self.mappings[(layer, fader)] = current_list
         self.rebuild_grid()
         self.save_config(CONFIG_FILE)
@@ -131,7 +130,6 @@ class VolMixMatrix(QMainWindow):
         self.table.setVerticalHeaderLabels([f"FADER {i+1}" for i in range(7)])
         self.table.setHorizontalHeaderLabels([self.all_targets.get(t, t) for t in self.visible_columns])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-
         for row in range(7):
             for col, tid in enumerate(self.visible_columns):
                 active = tid in self.mappings.get((layer, row+1), [])
