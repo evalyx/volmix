@@ -20,7 +20,6 @@ const char* SERIAL_PORT = "/dev/ttyUSB0";
 const int BAUD_RATE = B115200;
 const int THRESHOLD = 8;
 
-// Use a global string for the path determined at runtime
 std::string GLOBAL_CONFIG_PATH = "";
 
 struct FaderConfig {
@@ -29,25 +28,16 @@ struct FaderConfig {
 };
 
 std::mutex uiMutex;
-// Changed to multimap to allow multiple targets per fader
 std::map<int, std::multimap<int, FaderConfig>> layeredMapping;
 std::vector<int> currentPercents(9, 0);
-std::vector<int> rawDebugVals(9, 0);
 int activeLayer = 0;
 bool isSerialAlive = false;
 
 // --- UTILS ---
 
-// Resolves /home/$USER/.config/volmix/volmix.conf
 std::string getConfigPath() {
     const char* home = std::getenv("HOME");
-    std::string path;
-    if (home) {
-        path = std::string(home) + "/.config/volmix";
-    } else {
-        path = "./config"; // Fallback
-    }
-    // Create directory if missing
+    std::string path = (home) ? std::string(home) + "/.config/volmix" : "./config";
     system(("mkdir -p " + path).c_str());
     return path + "/volmix.conf";
 }
@@ -66,6 +56,7 @@ void loadConfig() {
     while (f_in >> cl >> cf >> cid >> calias) {
         layeredMapping[cl].insert({cf, {cid, calias}});
     }
+    std::cout << "[INFO] Configuration loaded from " << GLOBAL_CONFIG_PATH << std::endl;
 }
 
 void saveConfig() {
@@ -77,34 +68,18 @@ void saveConfig() {
     }
 }
 
-// --- UI HELPERS ---
-std::string getBar(int percent, std::string label) {
-    int width = 8;
-    int filled = (percent * width) / 100;
-    std::string bar = label + " [";
-    for (int i = 0; i < width; ++i) bar += (i < filled) ? "#" : " ";
-    return (percent == 0) ? label + " [ MUTE ]" : bar + "]";
-}
-
 void refreshUI() {
+    // Only print visual bars if we are actually in a terminal
     if (!isatty(STDIN_FILENO)) return;
+    
     std::lock_guard<std::mutex> lock(uiMutex);
     std::cout << "\033[s\033[1;1H\033[1;37;44m";
-    std::cout << " L" << activeLayer << " | " << (isSerialAlive ? "LIVE" : "DEAD") << " | ";
-    std::cout << getBar(currentPercents[1], "MST") << " " << currentPercents[1] << "% | ";
-
-    for(int i = 1; i <= 7; i++) {
-        std::string label = "F" + std::to_string(i);
-        if (layeredMapping[activeLayer].count(i)) {
-            label = layeredMapping[activeLayer].find(i)->second.alias;
-            if (layeredMapping[activeLayer].count(i) > 1) label += "+";
-        }
-        std::cout << getBar(currentPercents[i+1], label) << " ";
-    }
+    std::cout << " L" << activeLayer << " | " << (isSerialAlive ? "LIVE" : "DEAD") << " | MST " << currentPercents[1] << "% ";
     std::cout << "\033[0m\033[K\033[u" << std::flush;
 }
 
 // --- CORE LOGIC ---
+
 void applyVolume(std::string targetId, int rawValue, int faderIdx) {
     int percent = std::clamp((rawValue * 100) / 1014, 0, 100);
     currentPercents[faderIdx] = percent;
@@ -119,39 +94,25 @@ void applyVolume(std::string targetId, int rawValue, int faderIdx) {
 
 void serialThread() {
     while (true) {
-        // 1. Attempt to open the port
         int fd = open(SERIAL_PORT, O_RDONLY | O_NOCTTY);
-
         if (fd < 0) {
             isSerialAlive = false;
-            refreshUI(); // Update UI to show "DEAD"
-            // Wait before trying again to avoid CPU pegging
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
 
-        // 2. Configure the port
         struct termios tty;
-        if (tcgetattr(fd, &tty) != 0) {
-            close(fd);
-            continue;
-        }
-
-        cfsetispeed(&tty, BAUD_RATE);
-        cfsetospeed(&tty, BAUD_RATE);
+        if (tcgetattr(fd, &tty) != 0) { close(fd); continue; }
+        cfsetispeed(&tty, BAUD_RATE); cfsetospeed(&tty, BAUD_RATE);
         tty.c_cflag |= (CLOCAL | CREAD | CS8);
         tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
         tcsetattr(fd, TCSANOW, &tty);
 
         isSerialAlive = true;
-        refreshUI();
-
         std::vector<int> lastVals(10, -1);
         std::string buffer;
         char c;
 
-        // 3. Read loop
-        // read() will return <= 0 if the device is unplugged
         while (read(fd, &c, 1) > 0) {
             if (c == '\n') {
                 if (buffer.find("DATA") != std::string::npos) {
@@ -162,18 +123,12 @@ void serialThread() {
                         if (item == "DATA") continue;
                         try { vals.push_back(std::stoi(item)); } catch (...) {}
                     }
-
                     if (vals.size() >= 9) {
                         activeLayer = vals[0];
-                        for(int i = 1; i <= 8; i++) rawDebugVals[i] = vals[i];
-
-                        // Master Fader
                         if (std::abs(vals[1] - lastVals[1]) > THRESHOLD) {
                             applyVolume("@DEFAULT_AUDIO_SINK@", vals[1], 1);
                             lastVals[1] = vals[1];
                         }
-
-                        // Other Faders
                         for (int i = 1; i <= 7; i++) {
                             if (std::abs(vals[i+1] - lastVals[i+1]) > THRESHOLD) {
                                 std::lock_guard<std::mutex> lock(uiMutex);
@@ -188,16 +143,10 @@ void serialThread() {
                     }
                 }
                 buffer.clear();
-            } else if (c != '\r') {
-                buffer += c;
-            }
+            } else if (c != '\r') buffer += c;
         }
-
-        // 4. Cleanup on disconnect
         isSerialAlive = false;
         close(fd);
-        refreshUI();
-        // Short pause before attempting to reconnect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
@@ -214,46 +163,29 @@ int main() {
     fds[0].fd = STDIN_FILENO;
     fds[0].events = POLLIN;
 
+    std::cout << "[READY] VolMix Backend started. Using: " << GLOBAL_CONFIG_PATH << std::endl;
+
     while (true) {
+        // Auto-reload if file changes
         time_t currentMTime = getFileMTime(GLOBAL_CONFIG_PATH);
         if (currentMTime > lastMTime) {
             loadConfig();
             lastMTime = currentMTime;
         }
 
+        // Handle Terminal input safely (won't crash in systemd)
         int ret = poll(fds, 1, 100);
         if (ret > 0 && (fds[0].revents & POLLIN)) {
             std::string input;
-            if (!std::getline(std::cin, input) || input == "exit") break;
-
-            if (input == "ls") {
-                std::cout << "Config Path: " << GLOBAL_CONFIG_PATH << "\n";
-                // Add your full interface display logic here if needed
-            }
-            else if (input.substr(0, 7) == "unbind ") {
-                int ul, uf; char ud; std::stringstream ss(input.substr(7));
-                if (ss >> ul >> ud >> uf) {
-                    { std::lock_guard<std::mutex> lock(uiMutex); layeredMapping[ul].erase(uf); }
-                    saveConfig();
-                    lastMTime = getFileMTime(GLOBAL_CONFIG_PATH);
+            if (std::getline(std::cin, input)) {
+                if (input == "exit") break;
+                if (input == "ls") {
+                    std::cout << "Config Path: " << GLOBAL_CONFIG_PATH << std::endl;
                 }
-            } else {
-                int l, f; std::string id, name = "";
-                std::string processed = input;
-                std::replace(processed.begin(), processed.end(), '-', ' ');
-                std::stringstream pss(processed);
-                if (pss >> l >> f >> id) {
-                    if (!(pss >> name)) name = "F" + std::to_string(f);
-                    { std::lock_guard<std::mutex> lock(uiMutex);
-                        layeredMapping[l].insert({f, {id, name}}); }
-                        saveConfig();
-                        lastMTime = getFileMTime(GLOBAL_CONFIG_PATH);
-                }
+                // (Additional CLI commands could go here)
             }
-            std::cout << "Command: " << std::flush;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
     return 0;
 }
