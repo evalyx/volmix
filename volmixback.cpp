@@ -29,7 +29,7 @@ struct FaderConfig {
 
 std::mutex uiMutex;
 std::map<int, std::multimap<int, FaderConfig>> layeredMapping;
-std::vector<int> currentPercents(9, 0);
+std::vector<int> currentPercents(9, 0); // Stores the last known % for each physical fader
 int activeLayer = 0;
 bool isSerialAlive = false;
 
@@ -56,41 +56,26 @@ void loadConfig() {
     while (f_in >> cl >> cf >> cid >> calias) {
         layeredMapping[cl].insert({cf, {cid, calias}});
     }
-    std::cout << "[INFO] Configuration loaded from " << GLOBAL_CONFIG_PATH << std::endl;
+    std::cout << "[INFO] Configuration loaded." << std::endl;
 }
 
-void saveConfig() {
-    std::ofstream f_out(GLOBAL_CONFIG_PATH);
-    for (auto const& [lay, faders] : layeredMapping) {
-        for (auto const& [f, cfg] : faders) {
-            f_out << lay << " " << f << " " << cfg.id << " " << cfg.alias << "\n";
-        }
-    }
-}
-
-void refreshUI() {
-    // Only print visual bars if we are actually in a terminal
-    if (!isatty(STDIN_FILENO)) return;
-    
-    std::lock_guard<std::mutex> lock(uiMutex);
-    std::cout << "\033[s\033[1;1H\033[1;37;44m";
-    std::cout << " L" << activeLayer << " | " << (isSerialAlive ? "LIVE" : "DEAD") << " | MST " << currentPercents[1] << "% ";
-    std::cout << "\033[0m\033[K\033[u" << std::flush;
-}
-
-// --- CORE LOGIC ---
-
-void applyVolume(std::string targetId, int rawValue, int faderIdx) {
-    int percent = std::clamp((rawValue * 100) / 1014, 0, 100);
-    currentPercents[faderIdx] = percent;
+// Helper to send command to PipeWire
+void runWpctl(std::string targetId, int percent) {
     if (targetId.empty() || targetId == "---") return;
-
     double vol = percent / 100.0;
     std::stringstream cmd;
     cmd << "wpctl set-volume " << targetId << " " << std::fixed << std::setprecision(2) << vol << " && ";
     cmd << "wpctl set-mute " << targetId << " " << (percent == 0 ? "1" : "0");
     system((cmd.str() + " > /dev/null 2>&1 &").c_str());
 }
+
+void applyVolume(std::string targetId, int rawValue, int faderIdx) {
+    int percent = std::clamp((rawValue * 100) / 1014, 0, 100);
+    currentPercents[faderIdx] = percent;
+    runWpctl(targetId, percent);
+}
+
+// --- SERIAL THREAD ---
 
 void serialThread() {
     while (true) {
@@ -125,10 +110,12 @@ void serialThread() {
                     }
                     if (vals.size() >= 9) {
                         activeLayer = vals[0];
+                        // Update Master
                         if (std::abs(vals[1] - lastVals[1]) > THRESHOLD) {
                             applyVolume("@DEFAULT_AUDIO_SINK@", vals[1], 1);
                             lastVals[1] = vals[1];
                         }
+                        // Update Slaves
                         for (int i = 1; i <= 7; i++) {
                             if (std::abs(vals[i+1] - lastVals[i+1]) > THRESHOLD) {
                                 std::lock_guard<std::mutex> lock(uiMutex);
@@ -139,7 +126,6 @@ void serialThread() {
                                 lastVals[i+1] = vals[i+1];
                             }
                         }
-                        refreshUI();
                     }
                 }
                 buffer.clear();
@@ -163,26 +149,37 @@ int main() {
     fds[0].fd = STDIN_FILENO;
     fds[0].events = POLLIN;
 
-    std::cout << "[READY] VolMix Backend started. Using: " << GLOBAL_CONFIG_PATH << std::endl;
+    auto lastEnforceTime = std::chrono::steady_clock::now();
 
     while (true) {
-        // Auto-reload if file changes
+        // 1. Config Change Detection
         time_t currentMTime = getFileMTime(GLOBAL_CONFIG_PATH);
         if (currentMTime > lastMTime) {
             loadConfig();
             lastMTime = currentMTime;
         }
 
-        // Handle Terminal input safely (won't crash in systemd)
+        // 2. ENFORCEMENT LOGIC (The Fix)
+        // Every 2 seconds, re-apply the current volumes to catch apps that restarted
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastEnforceTime).count() >= 2) {
+            std::lock_guard<std::mutex> lock(uiMutex);
+            // Re-apply Master
+            runWpctl("@DEFAULT_AUDIO_SINK@", currentPercents[1]);
+            // Re-apply all mapped apps for the active layer
+            auto range = layeredMapping[activeLayer];
+            for (auto const& [faderIdx, cfg] : range) {
+                runWpctl(cfg.id, currentPercents[faderIdx+1]);
+            }
+            lastEnforceTime = now;
+        }
+
+        // 3. Command Input Handle
         int ret = poll(fds, 1, 100);
         if (ret > 0 && (fds[0].revents & POLLIN)) {
             std::string input;
             if (std::getline(std::cin, input)) {
                 if (input == "exit") break;
-                if (input == "ls") {
-                    std::cout << "Config Path: " << GLOBAL_CONFIG_PATH << std::endl;
-                }
-                // (Additional CLI commands could go here)
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
